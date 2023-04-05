@@ -35,10 +35,12 @@ myjet = np.array([[0.        , 0.        , 0.5       ],
 class SuperPointNet(torch.nn.Module):
     """ Pytorch definition of SuperPoint Network. """
 
-    def __init__(self):
+    def __init__(self, desc=True):
         super(SuperPointNet, self).__init__()
         self.relu = torch.nn.ReLU(inplace=True)
         self.pool = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+        self.desc = desc
+
         c1, c2, c3, c4, c5, d1 = 64, 64, 128, 128, 256, 256
         # Shared Encoder.
         self.conv1a = torch.nn.Conv2d(
@@ -93,18 +95,21 @@ class SuperPointNet(torch.nn.Module):
         cPa = self.relu(self.convPa(x))
         semi = self.convPb(cPa)
         # Descriptor Head.
-        cDa = self.relu(self.convDa(x))
-        desc = self.convDb(cDa)
-        dn = torch.norm(desc, p=2, dim=1)  # Compute the norm.
-        desc = desc.div(torch.unsqueeze(dn, 1))  # Divide by norm to normalize.
-        return semi, desc
+        if self.desc:        
+            cDa = self.relu(self.convDa(x))
+            desc = self.convDb(cDa)
+            dn = torch.norm(desc, p=2, dim=1)  # Compute the norm.
+            desc = desc.div(torch.unsqueeze(dn, 1))  # Divide by norm to normalize.
+            return semi, desc
+        else:
+            return semi
 
 
 class SuperPointFrontend(object):
     """ Wrapper around pytorch net to help with pre and post image processing. """
 
     def __init__(self, weights_path, nms_dist, conf_thresh, nn_thresh,
-                 cuda=False):
+                 cuda=False, desc=True):
         self.name = 'SuperPoint'
         self.cuda = cuda
         self.nms_dist = nms_dist
@@ -112,9 +117,10 @@ class SuperPointFrontend(object):
         self.nn_thresh = nn_thresh  # L2 descriptor distance for good match.
         self.cell = 8  # Size of each output cell. Keep this fixed.
         self.border_remove = 4  # Remove points this close to the border.
+        self.desc = desc
 
         # Load the network in inference mode.
-        self.net = SuperPointNet()
+        self.net = SuperPointNet(self.desc)
         if cuda:
             # Train on GPU, deploy on GPU.
             self.net.load_state_dict(torch.load(weights_path))
@@ -216,7 +222,13 @@ class SuperPointFrontend(object):
             inp = inp.cuda()
         # Forward pass of network.
         outs = self.net.forward(inp)
-        semi, coarse_desc = outs[0], outs[1]
+
+        # whether generate descriptor
+        if self.desc:
+            semi, coarse_desc = outs[0], outs[1]
+        else:
+            semi = outs[0]
+
         # Convert pytorch -> numpy.
         semi = semi.data.cpu().numpy().squeeze()
         # --- Process points.
@@ -249,23 +261,27 @@ class SuperPointFrontend(object):
         toremove = np.logical_or(toremoveW, toremoveH)
         pts = pts[:, ~toremove]
         # --- Process descriptor.
-        D = coarse_desc.shape[1]
-        if pts.shape[1] == 0:
-            desc = np.zeros((D, 0))
+        if self.desc:                     # if it has a descriptor
+            D = coarse_desc.shape[1]
+            if pts.shape[1] == 0:
+                desc = np.zeros((D, 0))
+            else:
+                # Interpolate into descriptor map using 2D point locations.
+                samp_pts = torch.from_numpy(pts[:2, :].copy())
+                samp_pts[0, :] = (samp_pts[0, :] / (float(W) / 2.)) - 1.
+                samp_pts[1, :] = (samp_pts[1, :] / (float(H) / 2.)) - 1.
+                samp_pts = samp_pts.transpose(0, 1).contiguous()
+                samp_pts = samp_pts.view(1, 1, -1, 2)
+                samp_pts = samp_pts.float()
+                if self.cuda:
+                    samp_pts = samp_pts.cuda()
+                desc = torch.nn.functional.grid_sample(coarse_desc, samp_pts)
+                desc = desc.data.cpu().numpy().reshape(D, -1)
+                desc /= np.linalg.norm(desc, axis=0)[np.newaxis, :]
+            return pts, desc, heatmap
+
         else:
-            # Interpolate into descriptor map using 2D point locations.
-            samp_pts = torch.from_numpy(pts[:2, :].copy())
-            samp_pts[0, :] = (samp_pts[0, :] / (float(W) / 2.)) - 1.
-            samp_pts[1, :] = (samp_pts[1, :] / (float(H) / 2.)) - 1.
-            samp_pts = samp_pts.transpose(0, 1).contiguous()
-            samp_pts = samp_pts.view(1, 1, -1, 2)
-            samp_pts = samp_pts.float()
-            if self.cuda:
-                samp_pts = samp_pts.cuda()
-            desc = torch.nn.functional.grid_sample(coarse_desc, samp_pts)
-            desc = desc.data.cpu().numpy().reshape(D, -1)
-            desc /= np.linalg.norm(desc, axis=0)[np.newaxis, :]
-        return pts, desc, heatmap
+            return pts, heatmap
 
 
 if __name__ == '__main__':
@@ -296,6 +312,8 @@ if __name__ == '__main__':
         help='Save output frames to a directory (default: False)')
     parser.add_argument('--write_dir', type=str, default='ret_outputs/',
         help='Directory where to write output frames (default: ret_outputs/).')
+    parser.add_argument('--without_desc', action='store_true',
+        help='Do not compute descriptors (default: False).')
     opt = parser.parse_args()
     print(opt)
 
@@ -314,7 +332,8 @@ if __name__ == '__main__':
                           nms_dist=opt.nms_dist,
                           conf_thresh=opt.conf_thresh,
                           nn_thresh=opt.nn_thresh,
-                          cuda=opt.cuda)
+                          cuda=opt.cuda,
+                          desc=not opt.without_desc)
     print('==> Successfully loaded pre-trained network.')
 
     # Create a window to display the demo.
@@ -340,9 +359,15 @@ if __name__ == '__main__':
 
     # Get points and descriptors.
     start1 = time.time()
-    pts, desc, heatmap = fe.run(grayim)
+
+    # whether to compute descriptors
+    if not opt.without_desc:
+        pts, desc, heatmap = fe.run(grayim)
+    else:
+        pts, heatmap = fe.run(grayim)
+
     end1 = time.time()
-    print('==>Computing keypoints and descriptors')
+    print('==>Computing keypoints')
     print(f'Elapsed time: {end1 - start1}, with image size(w, h): {img_size}')
 
     # Generate results 
